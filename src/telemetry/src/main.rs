@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fs::metadata(SOCKET_PATH).is_ok() {
         fs::remove_file(SOCKET_PATH)?;
     }
-    
+
     let listener = UnixListener::bind(SOCKET_PATH)?;
     println!("Broadcasting telemetry on {}", SOCKET_PATH);
 
@@ -36,18 +36,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match stream {
             Ok(mut stream) => {
                 println!("Client connected. Starting telemetry stream...");
-                
+
                 // Spawn a new thread for the connected client to prevent blocking
                 thread::spawn(move || {
                     // Re-initialize NVML inside the thread for safety
                     let nvml_thread = Nvml::init().unwrap();
                     let device_thread = nvml_thread.device_by_index(0).unwrap();
-                    
+
                     loop {
                         // Fetch NVML Metrics
                         let util = device_thread.utilization_rates().unwrap();
                         let mem = device_thread.memory_info().unwrap();
-                        let temp = device_thread.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu).unwrap();
+                        let temp = device_thread
+                            .temperature(
+                                nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu,
+                            )
+                            .unwrap();
 
                         // Package into struct
                         let state = GpuState {
