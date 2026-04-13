@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 pub enum InterceptRequest {
     Malloc { bytes: usize },
     Free { ptr: String },
-    Compute { grid_x: u32, block_x: u32 }, 
+    Compute { grid_x: u32, block_x: u32 },
+    // Add the new variant to match the JSON payload
+    Cublas_sgemm { m: u64, n: u64, k: u64 }, 
 }
 
 #[derive(Debug, Serialize)]

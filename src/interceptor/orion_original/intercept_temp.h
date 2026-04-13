@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <vector>
 
+void send_to_scheduler(const char *json_msg);
+
 typedef struct kernel_record {
 
   const void *func;

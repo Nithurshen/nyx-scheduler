@@ -12,16 +12,39 @@ use protocol::{InterceptRequest, SchedulerResponse};
 const SOCK_PATH: &str = "/tmp/nyx.sock";
 const TELEMETRY_SOCK_PATH: &str = "/tmp/nyx_telemetry.sock";
 
+#[derive(Debug)]
+enum JobClass {
+    Lightweight,
+    ComputeBound,
+    MemoryBound,
+}
+
+// 1. The Profiler: Analyzes the computational graph's shape
+fn classify_job(m: u64, n: u64, k: u64, requested_bytes: u64) -> JobClass {
+    // Estimated floating point operations for a matrix multiplication
+    let estimated_flops = 2 * m * n * k;
+    
+    // How math-heavy is this job relative to its memory footprint?
+    let compute_density = estimated_flops as f64 / (requested_bytes as f64 + 1.0);
+
+    // Thresholds: Can be tweaked based on your specific GPUs
+    if estimated_flops < 500_000_000 && requested_bytes < 100_000_000 {
+        JobClass::Lightweight
+    } else if compute_density > 50.0 {
+        JobClass::ComputeBound
+    } else {
+        JobClass::MemoryBound
+    }
+}
+
 // 1. Internal State Structure
 #[derive(Debug, Default)]
 struct SchedulerState {
     pub vram_total_mb: u64,
     pub vram_used_mb: u64,
-    // We track "reserved" bytes to prevent overcommitting VRAM 
-    // before the telemetry daemon catches up to the new allocations.
     pub vram_reserved_bytes: u64, 
+    pub gpu_util_pct: u32, // NEW: Track GPU compute load for time-slicing
 }
-
 // Struct matching the JSON emitted by the telemetry daemon
 #[derive(Debug, Deserialize)]
 struct GpuState {
@@ -82,7 +105,7 @@ async fn subscribe_to_telemetry(state: Arc<Mutex<SchedulerState>>) {
                         let mut s = state.lock().await;
                         s.vram_total_mb = gpu_state.vram_total_mb;
                         s.vram_used_mb = gpu_state.vram_used_mb;
-                        // Reset reserved bytes periodically as telemetry catches up
+                        s.gpu_util_pct = gpu_state.gpu_util_pct; // NEW: Update load
                         s.vram_reserved_bytes = 0; 
                     }
                     line.clear();
@@ -142,12 +165,70 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<SchedulerState>>
                 let response = SchedulerResponse { status: "Go".to_string() };
                 stream.write_all(serde_json::to_string(&response).unwrap().as_bytes()).await?;
             }
+            Ok(InterceptRequest::Cublas_sgemm { m, n, k }) => {
+    println!("Intercepted Graph Shape: m={}, n={}, k={}", m, n, k);
+    
+    // We assume an average of 10MB temporary workspace for standard GEMM if not explicitly tracked
+    let estimated_vram = 10_485_760; 
+    let job_class = classify_job(m, n, k, estimated_vram);
+    
+    println!("Job Classified as: {:?}", job_class);
+
+    loop {
+        let mut s = state.lock().await;
+        let mut should_grant = false;
+
+        // 2. The Decision Matrix: Route jobs based on hardware state
+        match job_class {
+            JobClass::Lightweight => {
+                // Squeeze small jobs in unless the GPU is absolutely melting
+                if s.gpu_util_pct < 95 { should_grant = true; }
+            }
+            JobClass::ComputeBound => {
+                // If the GPU is already crunching heavy math, QUEUE this job to prevent interference
+                if s.gpu_util_pct < 75 { should_grant = true; }
+            }
+            JobClass::MemoryBound => {
+                // If it's memory heavy, we care more about VRAM availability than SM compute load
+                let vram_used_bytes = (s.vram_used_mb * 1024 * 1024) + s.vram_reserved_bytes;
+                if vram_used_bytes + estimated_vram < (s.vram_total_mb * 1024 * 1024) {
+                    should_grant = true;
+                    // 2. ADD THIS LINE: Actually reserve the memory!
+                    s.vram_reserved_bytes += estimated_vram; 
+                }
+            }
+        }
+
+        if should_grant {
+            break; // Send the "Go" signal to the C++ Interceptor
+        }
+
+        // Job queued. Drop lock and yield to software queue.
+        drop(s);
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+    }
+
+    let response = SchedulerResponse { status: "Go".to_string() };
+    stream.write_all(serde_json::to_string(&response).unwrap().as_bytes()).await?;
+}
             // NEW: Handle compute requests
             Ok(InterceptRequest::Compute { grid_x, block_x }) => {
-                println!("Client requesting compute slice! (Grid X: {}, Block X: {})", grid_x, block_x);
+                println!("Compute slice requested (Grid X: {}, Block X: {})", grid_x, block_x);
                 
-                // TODO: Future Time-Slicing Logic. 
-                // If another client is actively computing, we would sleep() here!
+                // Queuing logic: Loop and yield if the GPU is currently saturated
+                loop {
+                    let s = state.lock().await;
+                    
+                    // Time-Slicing Threshold: If GPU is above 90% utilization, 
+                    // we hold this kernel launch to let current SMs flush out.
+                    if s.gpu_util_pct < 90 {
+                        break; 
+                    }
+                    
+                    // Drop lock and sleep briefly to act as a software queue
+                    drop(s);
+                    sleep(Duration::from_millis(10)).await;
+                }
                 
                 let response = SchedulerResponse { status: "Go".to_string() };
                 stream.write_all(serde_json::to_string(&response).unwrap().as_bytes()).await?;

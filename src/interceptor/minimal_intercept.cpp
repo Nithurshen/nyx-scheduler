@@ -10,54 +10,37 @@
 // Function pointers to hold the REAL CUDA functions
 static cudaError_t (*real_cudaMalloc)(void **, size_t) = NULL;
 static cudaError_t (*real_cudaFree)(void *) = NULL;
+static cudaError_t (*real_cudaLaunchKernel)(const void *, dim3, dim3, void **, size_t, cudaStream_t) = NULL;
 
 // Helper function to send JSON to the Rust scheduler and wait for a reply
 void send_to_scheduler(const char *json_msg) {
   int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sock < 0) return; // If socket creation fails, just silently continue
+  if (sock < 0) return; 
 
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, "/tmp/nyx.sock", sizeof(addr.sun_path) - 1);
 
-  // Try to connect to the Rust scheduling daemon
   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-    
-    // 1. Send the request (e.g., {"action": "malloc", "bytes": 16000000})
     send(sock, json_msg, strlen(json_msg), 0);
-
-    // 2. Block and wait for the scheduler's response (e.g., {"status": "Go"})
     char buffer[256];
     int n = recv(sock, buffer, sizeof(buffer) - 1, 0);
-    
     if (n > 0) {
         buffer[n] = '\0';
-        // The interceptor successfully waited for the Rust daemon.
-        // In the future, you can parse this buffer to handle "Wait" commands
-        // and loop until "Go" is received.
     }
   }
-  
-  // 3. Close only after the handshake is complete
   close(sock);
 }
 
 // 1. Intercept cudaMalloc
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
   if (!real_cudaMalloc) {
-    real_cudaMalloc =
-        (cudaError_t(*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMalloc");
+    real_cudaMalloc = (cudaError_t(*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMalloc");
   }
-
-  // Format our message as a JSON string
   char msg[256];
   snprintf(msg, sizeof(msg), "{\"action\": \"malloc\", \"bytes\": %zu}", size);
-
-  // Send to the background scheduler and wait for permission
   send_to_scheduler(msg);
-
-  // Execute the actual GPU allocation
   return real_cudaMalloc(devPtr, size);
 }
 
@@ -66,14 +49,25 @@ extern "C" cudaError_t cudaFree(void *devPtr) {
   if (!real_cudaFree) {
     real_cudaFree = (cudaError_t(*)(void *))dlsym(RTLD_NEXT, "cudaFree");
   }
-
-  // Format the free message
   char msg[256];
   snprintf(msg, sizeof(msg), "{\"action\": \"free\", \"ptr\": \"%p\"}", devPtr);
+  send_to_scheduler(msg);
+  return real_cudaFree(devPtr);
+}
 
-  // Send to the background scheduler so it can update its VRAM ledger
+// 3. NEW: Intercept cudaLaunchKernel (Compute Time-Slicing)
+extern "C" cudaError_t cudaLaunchKernel(const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem, cudaStream_t stream) {
+  if (!real_cudaLaunchKernel) {
+    real_cudaLaunchKernel = (cudaError_t(*)(const void *, dim3, dim3, void **, size_t, cudaStream_t))dlsym(RTLD_NEXT, "cudaLaunchKernel");
+  }
+
+  // Format the compute message utilizing the grid and block X dimensions
+  char msg[256];
+  snprintf(msg, sizeof(msg), "{\"action\": \"compute\", \"grid_x\": %u, \"block_x\": %u}", gridDim.x, blockDim.x);
+
+  // Send to the background scheduler and wait for "Go"
   send_to_scheduler(msg);
 
-  // Execute the actual GPU deallocation
-  return real_cudaFree(devPtr);
+  // Execute the actual GPU kernel launch
+  return real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream);
 }
